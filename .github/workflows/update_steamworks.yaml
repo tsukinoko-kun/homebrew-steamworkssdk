@@ -1,0 +1,149 @@
+name: Check and Update Steamworks SDK
+
+on:
+  schedule:
+    # Run every Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch: # Allows manual triggering for testing
+
+jobs:
+  update-sdk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout My Tap Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout Upstream SDK Repo
+        uses: actions/checkout@v4
+        with:
+          repository: rlabrecque/SteamworksSDK
+          path: upstream_sdk
+          fetch-depth: 1
+
+      - name: Check for New Version
+        id: check_version
+        run: |
+          # Get the latest commit message from upstream
+          cd upstream_sdk
+          LATEST_MSG=$(git log -1 --format=%s)
+          echo "Upstream commit message: $LATEST_MSG"
+          
+          # Regex to match version format v1.63 or similar
+          if [[ "$LATEST_MSG" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+            echo "VERSION=$LATEST_MSG" >> $GITHUB_ENV
+            echo "detected_version=$LATEST_MSG" >> $GITHUB_OUTPUT
+          else
+            echo "Latest commit '$LATEST_MSG' does not look like a version tag. Exiting."
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          cd ..
+
+          # Check if this release already exists in my repo
+          if gh release view "$LATEST_MSG" > /dev/null 2>&1; then
+            echo "Release $LATEST_MSG already exists. Nothing to do."
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+          else
+            echo "New version $LATEST_MSG detected!"
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package Libraries
+        if: steps.check_version.outputs.update_needed == 'true'
+        run: |
+          VERSION=${{ env.VERSION }}
+          mkdir -p package/lib
+          
+          # Copy files to a structure suitable for the tarball
+          # We rename them slightly or keep folder structure to avoid conflicts
+          
+          # MacOS
+          mkdir -p package/lib/osx
+          cp upstream_sdk/redistributable_bin/osx/libsteam_api.dylib package/lib/osx/
+          
+          # Linux 64
+          mkdir -p package/lib/linux64
+          cp upstream_sdk/redistributable_bin/linux64/libsteam_api.so package/lib/linux64/
+          
+          # Linux ARM64
+          mkdir -p package/lib/linuxarm64
+          cp upstream_sdk/redistributable_bin/linuxarm64/libsteam_api.so package/lib/linuxarm64/
+          
+          # Create Tarball
+          cd package
+          tar -czf ../steamworks_sdk_libs.tar.gz .
+          cd ..
+          
+          # Calculate SHA256 for the formula
+          SHA256=$(sha256sum steamworks_sdk_libs.tar.gz | awk '{print $1}')
+          echo "ARCHIVE_SHA256=$SHA256" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        if: steps.check_version.outputs.update_needed == 'true'
+        run: |
+          gh release create ${{ env.VERSION }} steamworks_sdk_libs.tar.gz \
+            --title "Steamworks SDK ${{ env.VERSION }}" \
+            --notes "Automated release of Steamworks SDK libraries."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Homebrew Formula
+        if: steps.check_version.outputs.update_needed == 'true'
+        run: |
+          VERSION=${{ env.VERSION }}
+          SHA256=${{ env.ARCHIVE_SHA256 }}
+          REPO_URL="https://github.com/${{ github.repository }}"
+          DOWNLOAD_URL="$REPO_URL/releases/download/$VERSION/steamworks_sdk_libs.tar.gz"
+          
+          # Create Formula directory if it doesn't exist
+          mkdir -p Formula
+          
+          # Write the Ruby Formula
+          cat <<EOF > Formula/steamworks-sdk.rb
+          class SteamworksSdk < Formula
+            desc "Steamworks SDK Redistributable Binaries"
+            homepage "https://partner.steamgames.com/"
+            url "$DOWNLOAD_URL"
+            sha256 "$SHA256"
+            version "$VERSION"
+            license "Proprietary"
+
+            def install
+              if OS.mac?
+                lib.install "lib/osx/libsteam_api.dylib"
+              elsif OS.linux?
+                if Hardware::CPU.intel?
+                  lib.install "lib/linux64/libsteam_api.so"
+                elsif Hardware::CPU.arm?
+                  lib.install "lib/linuxarm64/libsteam_api.so"
+                end
+              end
+            end
+
+            test do
+              # Basic test to verify the library file exists in the installation
+              if OS.mac?
+                assert_predicate lib/"libsteam_api.dylib", :exist?
+              elsif OS.linux?
+                assert_predicate lib/"libsteam_api.so", :exist?
+              end
+            end
+          end
+          EOF
+
+      - name: Commit and Push Formula
+        if: steps.check_version.outputs.update_needed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add Formula/steamworks-sdk.rb
+          git commit -m "Update formula to ${{ env.VERSION }}"
+          git push
